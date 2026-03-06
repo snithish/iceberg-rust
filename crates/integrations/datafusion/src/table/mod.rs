@@ -42,6 +42,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
@@ -51,9 +52,10 @@ use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
-use crate::physical_plan::scan::IcebergTableScan;
+use crate::physical_plan::scan::{IcebergTableScan, get_column_names};
 use crate::physical_plan::sort::sort_by_partition;
 use crate::physical_plan::write::IcebergWriteExec;
 
@@ -124,7 +126,7 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -136,6 +138,34 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        let mut scan_builder = table.scan();
+
+        // apply projection
+        if let Some(proj) = get_column_names(self.schema.clone(), projection) {
+            scan_builder = scan_builder.select(proj);
+        } else {
+            scan_builder = scan_builder.select_all();
+        }
+
+        // apply filters
+        if let Some(pred) = convert_filters_to_predicate(filters) {
+            scan_builder = scan_builder.with_filter(pred);
+        }
+
+        let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+        let mut tasks_stream = table_scan.plan_files().await.map_err(to_datafusion_error)?;
+
+        let mut tasks = Vec::new();
+        while let Some(task) = tasks_stream.next().await {
+            tasks.push(task.map_err(to_datafusion_error)?);
+        }
+
+        let target_partitions = state.config().target_partitions().max(1);
+        let mut partitions = vec![Vec::new(); target_partitions];
+        for (i, task) in tasks.into_iter().enumerate() {
+            partitions[i % target_partitions].push(task);
+        }
+
         // Create scan with fresh metadata (always use current snapshot)
         Ok(Arc::new(IcebergTableScan::new(
             table,
@@ -144,6 +174,7 @@ impl TableProvider for IcebergTableProvider {
             projection,
             filters,
             limit,
+            partitions,
         )))
     }
 
@@ -309,11 +340,42 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let mut scan_builder = match self.snapshot_id {
+            Some(snapshot_id) => self.table.scan().snapshot_id(snapshot_id),
+            None => self.table.scan(),
+        };
+
+        // apply projection
+        if let Some(proj) = get_column_names(self.schema.clone(), projection) {
+            scan_builder = scan_builder.select(proj);
+        } else {
+            scan_builder = scan_builder.select_all();
+        }
+
+        // apply filters
+        if let Some(pred) = convert_filters_to_predicate(filters) {
+            scan_builder = scan_builder.with_filter(pred);
+        }
+
+        let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+        let mut tasks_stream = table_scan.plan_files().await.map_err(to_datafusion_error)?;
+
+        let mut tasks = Vec::new();
+        while let Some(task) = tasks_stream.next().await {
+            tasks.push(task.map_err(to_datafusion_error)?);
+        }
+
+        let target_partitions = state.config().target_partitions().max(1);
+        let mut partitions = vec![Vec::new(); target_partitions];
+        for (i, task) in tasks.into_iter().enumerate() {
+            partitions[i % target_partitions].push(task);
+        }
+
         // Use cached table (no refresh)
         Ok(Arc::new(IcebergTableScan::new(
             self.table.clone(),
@@ -322,6 +384,7 @@ impl TableProvider for IcebergStaticTableProvider {
             projection,
             filters,
             limit,
+            partitions,
         )))
     }
 

@@ -29,8 +29,10 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
+use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -53,6 +55,8 @@ pub struct IcebergTableScan {
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
     limit: Option<usize>,
+    /// The computed file scan tasks for this table partitioned for parallel execution.
+    tasks: Vec<Vec<FileScanTask>>,
 }
 
 impl IcebergTableScan {
@@ -64,12 +68,13 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        tasks: Vec<Vec<FileScanTask>>,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
-        let plan_properties = Self::compute_properties(output_schema.clone());
+        let plan_properties = Self::compute_properties(output_schema.clone(), tasks.len());
         let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
@@ -80,6 +85,7 @@ impl IcebergTableScan {
             projection,
             predicates,
             limit,
+            tasks,
         }
     }
 
@@ -103,14 +109,16 @@ impl IcebergTableScan {
         self.limit
     }
 
+    /// Tasks to be executed, partitioned.
+    pub fn tasks(&self) -> &[Vec<FileScanTask>] {
+        &self.tasks
+    }
+
     /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef) -> PlanProperties {
-        // TODO:
-        // This is more or less a placeholder, to be replaced
-        // once we support output-partitioning
+    fn compute_properties(schema: ArrowSchemaRef, num_partitions: usize) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -143,23 +151,29 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            self.projection.clone(),
-            self.predicates.clone(),
-        );
-        let stream = futures::stream::once(fut).try_flatten();
+        let tasks = self.tasks.get(partition).cloned().unwrap_or_default();
+        let tasks_stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
+
+        let arrow_reader_builder = ArrowReaderBuilder::new(self.table.file_io().clone());
+
+        // Add limit to builder if available, but limit applies globally?
+        // Wait, reading logic doesn't support limit directly on arrow builder yet.
+
+        let stream = arrow_reader_builder
+            .build()
+            .read(tasks_stream)
+            .map_err(to_datafusion_error)?
+            .map_err(to_datafusion_error);
 
         // Apply limit if specified
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
             if let Some(limit) = self.limit {
                 let mut remaining = limit;
                 Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
+                    let res: DFResult<Option<RecordBatch>> = if remaining == 0 {
                         Ok(None)
                     } else if batch.num_rows() <= remaining {
                         remaining -= batch.num_rows();
@@ -168,7 +182,8 @@ impl ExecutionPlan for IcebergTableScan {
                         let limited_batch = batch.slice(0, remaining);
                         remaining = 0;
                         Ok(Some(limited_batch))
-                    })
+                    };
+                    futures::future::ready(res)
                 }))
             } else {
                 Box::pin(stream)
@@ -200,40 +215,7 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
-    table: Table,
-    snapshot_id: Option<i64>,
-    column_names: Option<Vec<String>>,
-    predicates: Option<Predicate>,
-) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
-        None => scan_builder.select_all(),
-    };
-    if let Some(pred) = predicates {
-        scan_builder = scan_builder.with_filter(pred);
-    }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
-
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
-}
-
-fn get_column_names(
+pub(crate) fn get_column_names(
     schema: ArrowSchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> Option<Vec<String>> {
